@@ -24,14 +24,22 @@ let qrData = null;
 let connectionStatus = 'disconnected';
 let connectedPhone = null;
 let isStarting = false;
+const logs = [];
+
+function addLog(msg) {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  console.log(line);
+  logs.push(line);
+  if (logs.length > 50) logs.shift();
+}
 
 function clearAuthFolder() {
   if (fs.existsSync(AUTH_FOLDER)) {
     try {
       fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-      console.log('Cleaned auth session folder');
+      addLog('Cleaned auth session folder');
     } catch (err) {
-      console.error('Failed to clean auth folder:', err.message);
+      addLog(`Failed to clean auth folder: ${err.message}`);
     }
   }
 }
@@ -44,20 +52,19 @@ async function startSock() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
     const { version } = await fetchLatestBaileysVersion();
 
-    console.log(`Starting WhatsApp socket with version ${version.join('.')}`);
+    addLog(`Starting WhatsApp socket with version ${version.join('.')}`);
 
     sock = makeWASocket({
       version,
       auth: state,
-      logger: pino({ level: 'info' }),
+      logger: pino({ level: 'silent' }), // suppress verbose noise
       printQRInTerminal: false,
-      browser: Browsers.macOS('Desktop'),
+      browser: Browsers.ubuntu('Chrome'), // Standard WhatsApp Web browser (avoids Desktop signature rejection)
       syncFullHistory: false,
       markOnlineOnConnect: true,
       connectTimeoutMs: 60000
     });
 
-    // CRITICAL: Save credentials whenever WhatsApp updates them
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
@@ -67,40 +74,37 @@ async function startSock() {
         connectionStatus = 'connecting';
         try {
           qrData = await qrcode.toDataURL(qr);
-          console.log('Generated fresh QR code');
+          addLog('Generated fresh QR code');
         } catch (err) {
-          console.error('QR generation error:', err);
+          addLog(`QR generation error: ${err.message}`);
         }
       }
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(`Connection closed with statusCode: ${statusCode}`);
+        const errTrace = lastDisconnect?.error?.message || 'closed';
+        addLog(`Connection closed: statusCode ${statusCode} (${errTrace})`);
+        
         qrData = null;
         isStarting = false;
 
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-
-        // ONLY clear auth if user was explicitly logged out (401).
-        // NEVER clear on 515 (restartRequired) or network drops (408/428)!
-        if (isLoggedOut) {
-          console.log('User logged out — clearing auth session');
+        if (statusCode === DisconnectReason.loggedOut) {
+          addLog('User logged out — clearing credentials');
           connectionStatus = 'disconnected';
           connectedPhone = null;
           clearAuthFolder();
           setTimeout(startSock, 2000);
         } else {
-          // Reconnect immediately to finalize handshake
           connectionStatus = 'connecting';
-          console.log(`Reconnecting immediately to finish pairing (code ${statusCode})...`);
-          setTimeout(startSock, 1500);
+          addLog(`Reconnecting to finalize pairing (code ${statusCode})...`);
+          setTimeout(startSock, 2000);
         }
       } else if (connection === 'open') {
         connectionStatus = 'connected';
         qrData = null;
         isStarting = false;
         connectedPhone = sock.user?.id ? sock.user.id.split(':')[0] : 'Connected';
-        console.log(`✅ WhatsApp linked successfully for: ${connectedPhone}`);
+        addLog(`✅ WhatsApp linked successfully for: +${connectedPhone}`);
       }
     });
 
@@ -110,12 +114,12 @@ async function startSock() {
         if (!msg.key.fromMe && msg.message) {
           const from = msg.key.remoteJid;
           const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-          console.log(`Incoming message from ${from}: ${text}`);
+          addLog(`Incoming message from ${from}: ${text.slice(0, 40)}`);
         }
       }
     });
   } catch (err) {
-    console.error('Error starting socket:', err);
+    addLog(`Error in startSock: ${err.message}`);
     isStarting = false;
     setTimeout(startSock, 3000);
   }
@@ -132,11 +136,29 @@ app.get('/status', (req, res) => {
   });
 });
 
+app.get('/logs', (req, res) => {
+  res.json({ logs });
+});
+
+app.post('/pair-code', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone number required' });
+    if (!sock) return res.status(500).json({ error: 'Socket not initialized' });
+
+    const clean = phone.replace(/[^0-9]/g, '');
+    const code = await sock.requestPairingCode(clean);
+    addLog(`Pairing code requested for +${clean}: ${code}`);
+    res.json({ code });
+  } catch (err) {
+    addLog(`Pairing code error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/disconnect', async (req, res) => {
   try {
-    if (sock) {
-      await sock.logout();
-    }
+    if (sock) await sock.logout();
     clearAuthFolder();
     connectionStatus = 'disconnected';
     qrData = null;
@@ -170,5 +192,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  addLog(`Server listening on port ${PORT}`);
 });
