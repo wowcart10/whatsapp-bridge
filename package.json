@@ -1,13 +1,11 @@
 {
   "name": "whatsapp-bridge",
-  "version": "1.0.0",
-  "description": "WhatsApp Web Bridge for Lovable App",
+  "version": "2.0.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.24",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "express": "^4.19.2",
     "cors": "^2.8.5",
     "qrcode": "^1.5.3",
