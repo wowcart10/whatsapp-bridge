@@ -38,6 +38,7 @@ let sock = null;
 let qrCodeData = null;
 let connectionStatus = 'connecting';
 let connectionLogs = [];
+let reconnectTimer = null;
 
 function addLog(msg) {
   const timestamp = new Date().toLocaleTimeString('en-US', { timeZone: 'UTC' });
@@ -59,12 +60,18 @@ function clearAuthFolder() {
 }
 
 async function startWhatsApp() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   try {
-    addLog('Starting WhatsApp socket...');
+    addLog('Starting WhatsApp socket with fixed version [2, 3000, 1033893291]...');
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
     sock = makeWASocket({
       auth: state,
+      version: [2, 3000, 1033893291], // Fixes 405 Connection Failure on WhatsApp servers
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: Browsers.ubuntu('Chrome'),
@@ -82,7 +89,7 @@ async function startWhatsApp() {
         try {
           qrCodeData = await qrcode.toDataURL(qr);
           connectionStatus = 'connecting';
-          addLog('Generated fresh QR code');
+          addLog('✓ Generated fresh QR code');
         } catch (err) {
           addLog('Failed to generate QR data URL: ' + err.message);
         }
@@ -94,15 +101,15 @@ async function startWhatsApp() {
         const errorMsg = lastDisconnect?.error?.message || '';
         addLog(`Connection closed: statusCode ${statusCode || 'unknown'} (${errorMsg})`);
 
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405) {
           connectionStatus = 'disconnected';
-          addLog('Logged out. Clearing auth and restarting...');
+          addLog(`Clearing auth folder due to code ${statusCode} and restarting...`);
           clearAuthFolder();
-          setTimeout(startWhatsApp, 2000);
+          reconnectTimer = setTimeout(startWhatsApp, 3000);
         } else {
           connectionStatus = 'reconnecting';
-          addLog(`Reconnecting to finalize pairing (code ${statusCode})...`);
-          setTimeout(startWhatsApp, 2500);
+          addLog(`Reconnecting (code ${statusCode})...`);
+          reconnectTimer = setTimeout(startWhatsApp, 3000);
         }
       } else if (connection === 'open') {
         qrCodeData = null;
@@ -113,7 +120,7 @@ async function startWhatsApp() {
 
   } catch (err) {
     addLog('Fatal error in startWhatsApp: ' + err.message);
-    setTimeout(startWhatsApp, 5000);
+    reconnectTimer = setTimeout(startWhatsApp, 5000);
   }
 }
 
@@ -130,19 +137,31 @@ app.get('/logs', (req, res) => {
   res.json({ logs: connectionLogs });
 });
 
+app.post('/pair-code', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone number is required' });
+  try {
+    if (!sock) return res.status(400).json({ error: 'WhatsApp socket not initialized' });
+    const code = await sock.requestPairingCode(phone.replace(/[^0-9]/g, ''));
+    res.json({ success: true, code });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/disconnect', async (req, res) => {
   try {
     if (sock) {
       await sock.logout();
     }
-    clearAuthFolder();
-    connectionStatus = 'disconnected';
-    qrCodeData = null;
-    startWhatsApp();
-    res.json({ success: true, message: 'Disconnected' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    // Ignore logout errors
   }
+  clearAuthFolder();
+  connectionStatus = 'disconnected';
+  qrCodeData = null;
+  setTimeout(startWhatsApp, 1000);
+  res.json({ success: true, message: 'Disconnected' });
 });
 
 app.listen(PORT, () => {
