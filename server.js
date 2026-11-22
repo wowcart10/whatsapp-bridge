@@ -5,23 +5,48 @@ const fs = require('fs');
 const path = require('path');
 
 // ---------------------------------------------------------------------------
-// Auto-patch: Bypass Baileys WhatsApp Business account signature crash
+// Auto-patch Baileys to resolve WhatsApp 405 (Platform) & 500 (Signature) errors
 // ---------------------------------------------------------------------------
 try {
   const validatePath = path.join(__dirname, 'node_modules/@whiskeysockets/baileys/lib/Utils/validate-connection.js');
   if (fs.existsSync(validatePath)) {
     let content = fs.readFileSync(validatePath, 'utf8');
+    let modified = false;
+
+    // 1. Fix error 405: Use MACOS platform instead of WEB for companion handshake
+    if (content.includes('proto.ClientPayload.UserAgent.Platform.WEB')) {
+      content = content.replace(
+        'proto.ClientPayload.UserAgent.Platform.WEB',
+        'proto.ClientPayload.UserAgent.Platform.MACOS'
+      );
+      modified = true;
+      console.log('✓ Applied MACOS platform patch (fixes error 405)');
+    }
+
+    // 2. Fix error 500: Bypass ADV signature validation for WhatsApp Business accounts
     if (content.includes("throw new Boom('Invalid account signature')")) {
       content = content.replace(
         /throw new Boom\('Invalid account signature'\);?/g,
-        "// Account signature check bypassed for WhatsApp Business compatibility"
+        '// Signature bypassed for WhatsApp Business'
       );
+      modified = true;
+    }
+
+    if (content.includes("throw new Boom('Failed to verify account signature')")) {
+      content = content.replace(
+        /throw new Boom\('Failed to verify account signature'\);?/g,
+        '// Verification bypassed for WhatsApp Business'
+      );
+      modified = true;
+    }
+
+    if (modified) {
       fs.writeFileSync(validatePath, content, 'utf8');
-      console.log('✓ Successfully applied WhatsApp Business signature patch');
+      console.log('✓ Applied WhatsApp Business signature patch');
     }
   }
 } catch (err) {
-  console.warn('Signature patch warning:', err.message);
+  console.warn('Patch warning:', err.message);
 }
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
@@ -33,6 +58,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const AUTH_FOLDER = path.join(__dirname, 'auth_session');
+
+// Live WhatsApp Web revision as of today
+const WA_VERSION = [2, 3000, 1055775191];
 
 let sock = null;
 let qrCodeData = null;
@@ -66,11 +94,12 @@ async function startWhatsApp() {
   }
 
   try {
-    addLog('Starting WhatsApp socket...');
+    addLog(`Starting WhatsApp socket (v${WA_VERSION.join('.')})...`);
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
     sock = makeWASocket({
       auth: state,
+      version: WA_VERSION,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: Browsers.macOS('Desktop'),
@@ -100,15 +129,16 @@ async function startWhatsApp() {
         const errorMsg = lastDisconnect?.error?.message || '';
         addLog(`Connection closed: statusCode ${statusCode || 'unknown'} (${errorMsg})`);
 
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405) {
           connectionStatus = 'disconnected';
-          addLog('Logged out. Clearing auth folder and restarting...');
+          addLog(`Encountered code ${statusCode}. Clearing stale session state...`);
           clearAuthFolder();
-          reconnectTimer = setTimeout(startWhatsApp, 3000);
+          // 8-second backoff to avoid hammering WhatsApp servers
+          reconnectTimer = setTimeout(startWhatsApp, 8000);
         } else {
           connectionStatus = 'reconnecting';
           addLog(`Reconnecting (code ${statusCode})...`);
-          reconnectTimer = setTimeout(startWhatsApp, 3000);
+          reconnectTimer = setTimeout(startWhatsApp, 5000);
         }
       } else if (connection === 'open') {
         qrCodeData = null;
@@ -119,7 +149,7 @@ async function startWhatsApp() {
 
   } catch (err) {
     addLog('Fatal error in startWhatsApp: ' + err.message);
-    reconnectTimer = setTimeout(startWhatsApp, 5000);
+    reconnectTimer = setTimeout(startWhatsApp, 8000);
   }
 }
 
@@ -141,25 +171,25 @@ app.post('/pair-code', async (req, res) => {
   if (!phone) return res.status(400).json({ error: 'Phone number is required' });
   try {
     if (!sock) return res.status(400).json({ error: 'WhatsApp socket not initialized' });
-    const code = await sock.requestPairingCode(phone.replace(/[^0-9]/g, ''));
+    const cleanPhone = phone.replace(/[^0-9]/g, '');
+    addLog(`Requesting pairing code for phone: ${cleanPhone}`);
+    const code = await sock.requestPairingCode(cleanPhone);
+    addLog(`✓ Pairing code generated: ${code}`);
     res.json({ success: true, code });
   } catch (err) {
+    addLog(`Pairing code error: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/disconnect', async (req, res) => {
   try {
-    if (sock) {
-      await sock.logout();
-    }
-  } catch (err) {
-    // Ignore logout errors
-  }
+    if (sock) await sock.logout();
+  } catch (err) {}
   clearAuthFolder();
   connectionStatus = 'disconnected';
   qrCodeData = null;
-  setTimeout(startWhatsApp, 1000);
+  setTimeout(startWhatsApp, 2000);
   res.json({ success: true, message: 'Disconnected' });
 });
 
